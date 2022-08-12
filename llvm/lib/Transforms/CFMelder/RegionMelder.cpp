@@ -349,8 +349,7 @@ void MeldingHandler::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
       // create a select if left and right conditions are not same
       if (LeftCond != RightCond) {
         IRBuilder<> Builder(MergedBr);
-        MergedCond =
-            Builder.CreateSelect(DivCond, LeftCond, RightCond);
+        MergedCond = Builder.CreateSelect(DivCond, LeftCond, RightCond);
       }
       MergedBr->setCondition(MergedCond);
     }
@@ -381,8 +380,7 @@ void MeldingHandler::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
   // create a new branch in the merged block to set the targets based on
   // mergepath remove exiting mergeBr
   Builder.SetInsertPoint(MergedBr->getParent());
-  BranchInst *NewBi =
-      Builder.CreateCondBr(DivCond, NewBbLeftBr, NewBbRightBr);
+  BranchInst *NewBi = Builder.CreateCondBr(DivCond, NewBbLeftBr, NewBbRightBr);
   MergedBr->eraseFromParent();
 
   // update the value maps
@@ -429,8 +427,7 @@ void MeldingHandler::setOprendsForNonMatchingStore(StoreInst *SI, bool IsLeft) {
     ValueL = RedunLoad;
     ValueR = Val;
   }
-  Value *ValToStore =
-      Builder.CreateSelect(DivCond, ValueL, ValueR);
+  Value *ValToStore = Builder.CreateSelect(DivCond, ValueL, ValueR);
 
   // set the value
   SI->setOperand(0, ValToStore);
@@ -456,8 +453,8 @@ void MeldingHandler::setOperends(Instruction *LeftI, Instruction *RightI,
     // if the operends are different add a select to pick the correct one
     Value *NewOp = LeftOp ? LeftOp : RightOp;
     if (LeftOp && RightOp && LeftOp != RightOp) {
-      SelectInst *Select = SelectInst::Create(
-          DivCond, LeftOp, RightOp, "merged.select", MergedI);
+      SelectInst *Select = SelectInst::Create(DivCond, LeftOp, RightOp,
+                                              "merged.select", MergedI);
       NewOp = dyn_cast<Value>(Select);
     }
 
@@ -590,6 +587,61 @@ Region *RegionMelder::getRegionToReplicate(BasicBlock *MatchedBlock,
   return R;
 }
 
+void RegionMelder::runRegionReplication(BasicBlock *ExpandedBlock,
+                                        BasicBlock *MatchedBlock,
+                                        bool ExpandingLeft,
+                                        Region *RToReplicate) {
+
+  // simplify the replicated region
+  BasicBlock *ExitToReplicate = RToReplicate->getExit();
+  BasicBlock *EntryToReplicate = RToReplicate->getEntry();
+  if (Utils::requireRegionSimplification(RToReplicate)) {
+    INFO << "Replicated region is not a simple region, running region "
+            "simplification\n";
+    // BasicBlock *Entry = RToReplicate->getEntry();
+    ExitToReplicate =
+        simplifyRegion(RToReplicate->getExit(), RToReplicate->getEntry());
+
+    // recompute control-flow analyses , FIXME : this might be too expensive
+    CFGInfo.recompute();
+    RToReplicate = Utils::getRegionWithEntryExit(
+        *CFGInfo.getRegionInfo(), EntryToReplicate, ExitToReplicate);
+    assert(RToReplicate && "Can not find region with given entry and exit");
+
+    INFO << "region after region simplification : ";
+    errs() << "[";
+    RToReplicate->getEntry()->printAsOperand(errs(), false);
+    errs() << " : ";
+    RToReplicate->getExit()->printAsOperand(errs(), false);
+    errs() << "]\n";
+
+    MeldInfo.RegionsSimplified = true;
+  }
+
+  // errs() << "replicate the region\n";
+  // replicate the region
+  RegionReplicator RR(CFGInfo, RAResult.getDivCondition(), ExpandingLeft,
+                      EnableFullPredication);
+  Region *ReplicatedR = RR.replicate(ExpandedBlock, MatchedBlock, RToReplicate);
+
+  // errs() << "prepare for melding\n";
+  // prepare for melding
+  if (ExpandingLeft) {
+    MeldInfo.LEntry = ReplicatedR->getEntry();
+    MeldInfo.LExit = ReplicatedR->getExit();
+    MeldInfo.REntry = EntryToReplicate;
+    MeldInfo.RExit = ExitToReplicate;
+  } else {
+    MeldInfo.REntry = ReplicatedR->getEntry();
+    MeldInfo.RExit = ReplicatedR->getExit();
+    MeldInfo.LEntry = EntryToReplicate;
+    MeldInfo.LExit = ExitToReplicate;
+  }
+
+  // errs() << "here\n";
+  RR.getBasicBlockMapping(MeldInfo.BlockMap, ExpandingLeft);
+}
+
 bool RegionMelder::run() {
 
   // static int Count = 0;
@@ -627,55 +679,8 @@ bool RegionMelder::run() {
       RToReplicate = getRegionToReplicate(MatchedBlock, LeftPathEntry);
     }
 
-    // simplify the replicated region
-    BasicBlock *ExitToReplicate = RToReplicate->getExit();
-    BasicBlock *EntryToReplicate = RToReplicate->getEntry();
-    if (Utils::requireRegionSimplification(RToReplicate)) {
-      INFO << "Replicated region is not a simple region, running region "
-              "simplification\n";
-      // BasicBlock *Entry = RToReplicate->getEntry();
-      ExitToReplicate =
-          simplifyRegion(RToReplicate->getExit(), RToReplicate->getEntry());
-
-      // recompute control-flow analyses , FIXME : this might be too expensive
-      CFGInfo.recompute();
-      RToReplicate = Utils::getRegionWithEntryExit(
-          *CFGInfo.getRegionInfo(), EntryToReplicate, ExitToReplicate);
-      assert(RToReplicate && "Can not find region with given entry and exit");
-
-      INFO << "region after region simplification : ";
-      errs() << "[";
-      RToReplicate->getEntry()->printAsOperand(errs(), false);
-      errs() << " : ";
-      RToReplicate->getExit()->printAsOperand(errs(), false);
-      errs() << "]\n";
-
-      MeldInfo.RegionsSimplified = true;
-    }
-
-    // errs() << "replicate the region\n";
-    // replicate the region
-    RegionReplicator RR(CFGInfo, RAResult.getDivCondition(), ExpandingLeft,
-                        EnableFullPredication);
-    Region *ReplicatedR =
-        RR.replicate(ExpandedBlock, MatchedBlock, RToReplicate);
-
-    // errs() << "prepare for melding\n";
-    // prepare for melding
-    if (ExpandingLeft) {
-      MeldInfo.LEntry = ReplicatedR->getEntry();
-      MeldInfo.LExit = ReplicatedR->getExit();
-      MeldInfo.REntry = EntryToReplicate;
-      MeldInfo.RExit = ExitToReplicate;
-    } else {
-      MeldInfo.REntry = ReplicatedR->getEntry();
-      MeldInfo.RExit = ReplicatedR->getExit();
-      MeldInfo.LEntry = EntryToReplicate;
-      MeldInfo.LExit = ExitToReplicate;
-    }
-
-    // errs() << "here\n";
-    RR.getBasicBlockMapping(MeldInfo.BlockMap, ExpandingLeft);
+    runRegionReplication(ExpandedBlock, MatchedBlock, ExpandingLeft,
+                         RToReplicate);
 
     BBToRegionMeldings++;
 
@@ -714,8 +719,8 @@ bool RegionMelder::run() {
   // ".cfmelder.");
 
   if (!DisableMelding) {
-    MeldingHandler Handler(&CFGInfo.getFunction(), RAResult.getDivCondition(), 
-        CFGInfo.getTTI(), MeldInfo);
+    MeldingHandler Handler(&CFGInfo.getFunction(), RAResult.getDivCondition(),
+                           CFGInfo.getTTI(), MeldInfo);
     // compute alignment
     NumMeldings++;
     Handler.meld();
@@ -815,8 +820,8 @@ void MeldingHandler::runUnpredicationPass() {
       TrueTarget = TailBlock;
       FalseTarget = SplitBb;
     }
-    BranchInst *NewBr = BranchInst::Create(TrueTarget, FalseTarget,
-                                           DivCond, BB);
+    BranchInst *NewBr =
+        BranchInst::Create(TrueTarget, FalseTarget, DivCond, BB);
     OldBr->replaceAllUsesWith(NewBr);
     OldBr->eraseFromParent();
 

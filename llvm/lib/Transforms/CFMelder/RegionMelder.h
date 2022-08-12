@@ -181,11 +181,11 @@ private:
 
   void runUnpredicationPass();
   void updateSplitRangeMap(bool Direction, Instruction *I);
+
 public:
-  MeldingHandler(Function* Func, Value* DivCond, TargetTransformInfo &TTI,
+  MeldingHandler(Function *Func, Value *DivCond, TargetTransformInfo &TTI,
                  RegionMeldingInfo &MeldInfo)
-      : Func(Func), DivCond(DivCond),
-        TTI(TTI), MeldingInfo(MeldInfo) {}
+      : Func(Func), DivCond(DivCond), TTI(TTI), MeldingInfo(MeldInfo) {}
   /// merge two SESE regions (or SESE basic blocks)
   void meld();
 };
@@ -196,12 +196,13 @@ private:
   RegionAnalysisResult &RAResult;
   RegionMeldingInfo MeldInfo;
 
-  void runRegionReplication();
+  // does region replication. matched block is inside the 'RToReplicate'
+  // we replicate RToReplicate and place ExpandedBlock in a corresponding 
+  // position to MatchedBlock
+  void runRegionReplication(BasicBlock *ExpandedBlock, BasicBlock *MatchedBlock,
+                            bool ExpandingLeft, Region *RToReplicate);
   BasicBlock *addUnifyPHIBlock();
   void simplifyRegions();
-
-  /// undo the changes done in preprocess
-  void undoPreprocess();
 
   // makes the region SESE, after simplification exit block of the region
   // is connected to rest of the CFG with only one edge
