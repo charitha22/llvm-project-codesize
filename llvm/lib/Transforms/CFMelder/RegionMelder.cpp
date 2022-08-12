@@ -1088,6 +1088,7 @@ void RegionMelder::simplifyRegions() {
       BasicBlock *NewExit = simplifyRegion(Exit, Entry);
       // update the mapping
       MeldInfo.updateBlockMap(NewExit, OldExit, IsLeft);
+      MeldInfo.RegionsSimplified = true;
       return NewExit;
     }
     return Exit;
