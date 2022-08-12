@@ -13,6 +13,8 @@
 #include <sstream>
 using namespace llvm;
 
+// if the region's exit has predecessors from outside the region
+// region needs a simplification
 bool Utils::requireRegionSimplification(Region *R) {
   BasicBlock *Exit = R->getExit();
   for (auto PredIt = pred_begin(Exit); PredIt != pred_end(Exit); ++PredIt) {
@@ -178,12 +180,13 @@ double Utils::computeBlockSimilarity(BasicBlock *BB1, BasicBlock *BB2,
   int LatReductionAtBest = 0, TotalLatency = 0;
   // iterate over all blocks in replicated region
   for (auto *BB : Replicated->blocks()) {
-    // for the matched blocks compute the instructions that can merged in best case
+    // for the matched blocks compute the instructions that can merged in best
+    // case
     if (BB == BB1 || BB == BB2) {
       auto LatInfo = computeLatReductionAtBest(BB1, BB2);
       LatReductionAtBest += LatInfo.first;
       TotalLatency += LatInfo.second;
-    } 
+    }
     // else you have to pay one more branch to execute the block conditionally
     else {
       for (Instruction &I : *BB) {
@@ -254,7 +257,9 @@ std::string Utils::getNameStr(Value *V) {
 }
 
 void Utils::writeCFGToDotFile(Function &F, std::string Prefix) {
-  std::string Filename = (Prefix + F.getName() + ".dot").str();
+  static int Count = 0;
+  std::string Filename =
+      (Prefix + F.getName() + std::to_string(Count++) + ".dot").str();
   errs() << "Writing '" << Filename << "'...";
 
   std::error_code EC;

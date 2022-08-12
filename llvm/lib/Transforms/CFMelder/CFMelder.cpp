@@ -25,6 +25,7 @@
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Analysis/RegionInfoImpl.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/CodeGen/Analysis.h"
 #include "llvm/Frontend/OpenMP/OMP.h.inc"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -122,23 +123,23 @@ static bool runAnalysisOnly(Function &F, DominatorTree &DT,
 
   ControlFlowGraphInfo CFGInfo(F, DT, PDT, TTI);
 
-  for (auto BBIt : post_order(&F.getEntryBlock())) {
-    BasicBlock &BB = *BBIt;
+  for (auto *BB : post_order(&F.getEntryBlock())) {
     // check if this BB is the enrty to a diamond shaped control-flow
-    Value *BranchI = dyn_cast<Value>(BB.getTerminator());
-    if (Utils::isValidMergeLocation(BB, DT, PDT) &&
+    Value *BranchI = dyn_cast<Value>(BB->getTerminator());
+    if (Utils::isValidMergeLocation(*BB, DT, PDT) &&
         (GPUDA->isDivergent(*BranchI) || RunCFMelderAnalysisOnly)) {
 
       // DebugLoc DebugLocation = BB.begin()->getDebugLoc();
       INFO << "------------------------------------------------------------"
               "-------------------\n";
       INFO << "Valid merge location found at BB ";
-      BB.printAsOperand(errs(), false);
+      BB->printAsOperand(errs(), false);
       errs() << "\n";
-      RegionAnalyzer MA(&BB, CFGInfo);
-      MA.computeRegionMatch();
-      MA.printAnalysis(INFO);
-      INFO << "This merge is : " << (MA.hasAnyProfitableMatch() ? "" : "NOT")
+      RegionAnalyzer RA(BB, CFGInfo);
+      RA.computeRegionMatch();
+      RA.printAnalysis(INFO);
+      INFO << "This merge is : "
+           << (RA.getResult().hasAnyProfitableMatch() ? "" : "NOT")
            << " PROFITABLE!\n";
     }
   }
@@ -197,8 +198,9 @@ static bool runImplCodeSize(Function &F, DominatorTree &DT,
         ControlFlowGraphInfo CFGInfo(*Func, DT, PDT, TTI);
         RegionAnalyzer RA(BB, CFGInfo);
         RA.computeRegionMatch();
+        auto RAResult = RA.getResult();
 
-        if (RA.hasAnyProfitableMatch()) {
+        if (RAResult.hasAnyProfitableMatch()) {
 
           // Store the indexes of profitable merges
           SmallVector<int, 8> Profitable;
@@ -214,30 +216,32 @@ static bool runImplCodeSize(Function &F, DominatorTree &DT,
           RegionAnalyzer ClonedRA(dyn_cast<BasicBlock>(VMap[BB]),
                                   ClonedCFGInfo);
           ClonedRA.computeRegionMatch();
+          auto ClonedRAResult = ClonedRA.getResult();
 
-          for (unsigned I = 0; I < ClonedRA.regionMatchSize(); ++I) {
-            if (!ClonedRA.isRegionMatchProfitable(I))
-              continue;
+          // for (unsigned I = 0; I < ClonedRAResult.regionMatchSize(); ++I) {
+          //   if (!ClonedRAResult.isRegionMatchProfitable(I))
+          //     continue;
 
-            int SizeBefore = computeCodeSize(ClonedFunc, TTI);
-            RegionMelder ClonedRM(ClonedRA);
-            ClonedRM.merge(I);
-            int SizeAfter = computeCodeSize(ClonedFunc, TTI);
-            DEBUG << "Size changed from " << SizeBefore << " to " << SizeAfter
-		  << " : " << (SizeBefore - SizeAfter) << " : " << ((SizeBefore > SizeAfter)?"Profitable":"Unprofitable")
-                  << " Branch Fusion! [" << F.getName().str()  << "] ";
-	    BB->getTerminator()->dump();
-            if (SizeBefore > SizeAfter) {
-              Profitable.push_back(I);
-            }
-          }
+          int SizeBefore = computeCodeSize(ClonedFunc, TTI);
+          RegionMelder ClonedRM(ClonedCFGInfo, ClonedRAResult);
+          ClonedRM.run();
+          int SizeAfter = computeCodeSize(ClonedFunc, TTI);
+          DEBUG << "Size changed from " << SizeBefore << " to " << SizeAfter
+                << " : " << (SizeBefore - SizeAfter) << " : "
+                << ((SizeBefore > SizeAfter) ? "Profitable" : "Unprofitable")
+                << " Branch Fusion! [" << F.getName().str() << "] ";
+          BB->getTerminator()->dump();
+          // if (SizeBefore > SizeAfter) {
+          //   Profitable.push_back(I);
+          // }
+          // }
 
           // If there are profitble merges perform them on Func
-          if (!Profitable.empty()) {
-            for (int I : Profitable) {
-              RegionMelder RM(RA);
-              RM.merge(I);
-            }
+          if (SizeBefore > SizeAfter) {
+            // for (int I : Profitable) {
+            RegionMelder RM(CFGInfo, RAResult);
+            RM.run();
+            // }
             LocalChange = true;
           }
 
@@ -254,7 +258,7 @@ static bool runImplCodeSize(Function &F, DominatorTree &DT,
     }
 
     Changed |= LocalChange;
-    
+
     if (RunMeldingOnce)
       break;
   } while (LocalChange); // && CountIter < MaxIterations);
@@ -321,44 +325,44 @@ static bool runImpl(Function &F, DominatorTree &DT, PostDominatorTree &PDT,
     LocalChange = false;
     CountIter++;
 
-    for (auto &BBIt : post_order(&F.getEntryBlock())) {
-      BasicBlock &BB = *BBIt;
+    for (auto *BB : post_order(&F.getEntryBlock())) {
       // errs() << "BB name : " << BB.getNameOrAsOperand() << "\n";
       // check if this BB is the enrty to a diamond shaped control-flow
-      if (Utils::isValidMergeLocation(BB, DT, PDT)) {
+      if (Utils::isValidMergeLocation(*BB, DT, PDT)) {
         INFO << "Valid merge location found at BB ";
-        BB.printAsOperand(errs(), false);
+        BB->printAsOperand(errs(), false);
         errs() << "\n";
 
         ControlFlowGraphInfo CFGInfo(F, DT, PDT, TTI);
-        RegionAnalyzer MA(&BB, CFGInfo);
-        MA.computeRegionMatch();
-        if (MA.hasAnyProfitableMatch()) {
+        RegionAnalyzer RA(BB, CFGInfo);
+        RA.computeRegionMatch();
+        auto RAResult = RA.getResult();
+        if (RAResult.hasAnyProfitableMatch()) {
           INFO << "Melding is profitable\n";
 
-          for (unsigned I = 0; I < MA.regionMatchSize(); I++) {
-            // skip unprofitable melding
-            if (!MA.isRegionMatchProfitable(I))
-              continue;
-            RegionMelder RM(MA);
-            RM.merge(I);
-            LocalChange = true;
-            CFGInfo.recompute();
-          }
-          if (LocalChange) {
-            if (!NoSimplifyCFGAfterMelding) {
-              INFO << "Running CFG simplification\n";
-              if (simplifyFunction(
-                      F, TTI,
-                      SimplifyCFGOptionsObj.setSimplifyCondBranch(false)
-                          .sinkCommonInsts(false)
-                          .hoistCommonInsts(false))) {
-                DT.recalculate(F);
-                PDT.recalculate(F);
-              }
+          // for (unsigned I = 0; I < RAResult.regionMatchSize(); I++) {
+          // skip unprofitable melding
+          // if (!RAResult.isRegionMatchProfitable(I))
+          //   continue;
+          RegionMelder RM(CFGInfo, RAResult);
+          RM.run();
+          LocalChange = true;
+          CFGInfo.recompute();
+          // }
+          // if (LocalChange) {
+          if (!NoSimplifyCFGAfterMelding) {
+            INFO << "Running CFG simplification\n";
+            if (simplifyFunction(
+                    F, TTI,
+                    SimplifyCFGOptionsObj.setSimplifyCondBranch(false)
+                        .sinkCommonInsts(false)
+                        .hoistCommonInsts(false))) {
+              DT.recalculate(F);
+              PDT.recalculate(F);
             }
-            break;
           }
+          break;
+          // }
         }
       }
     }

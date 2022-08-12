@@ -125,6 +125,39 @@ public:
   int gap(int K) override { return 0; }
 };
 
+// store the region analyzer's result
+struct RegionAnalysisResult {
+private:
+  BasicBlock *DivBlock{nullptr};
+  // best matching of regions
+  SmallVector<std::shared_ptr<MergeableRegionPair>, 0> BestRegionMatch;
+  // best mathcing basic blocks, if regions do not exist
+  std::pair<BasicBlock *, BasicBlock *> BestBbMatch{nullptr, nullptr};
+  bool HasBlockMatch = false;
+  double BestBbMatchSimilarityScore = 0.0;
+
+  // needs region replication
+  bool RequireRegionReplication = false;
+
+  friend class RegionAnalyzer;
+
+public:
+  bool requireRegionReplication() { return RequireRegionReplication; }
+  // region analyzer's result
+  DenseMap<BasicBlock *, BasicBlock *> getRegionMatch(unsigned Index);
+  std::pair<BasicBlock *, BasicBlock *>
+  getRegionMatchEntryBlocks(unsigned Index);
+  std::pair<BasicBlock *, BasicBlock *>
+  getRegionMatchExitBlocks(unsigned Index);
+  bool hasAnyProfitableMatch();
+  bool isRegionMatchProfitable(unsigned Index);
+  unsigned regionMatchSize() const;
+  unsigned getMostProfitableRegionMatchIndex();
+  BasicBlock *getDivBlock() { return DivBlock; }
+  Value* getDivCondition();
+  void print(llvm::raw_ostream &OS);
+};
+
 // class to analyze merebale control-flow
 class RegionAnalyzer {
 private:
@@ -135,47 +168,29 @@ private:
   // left path and right path regions
   SmallVector<Region *, 0> LeftRegions;
   SmallVector<Region *, 0> RightRegions;
-
-  // best matching of regions
-  SmallVector<std::shared_ptr<MergeableRegionPair>, 0> BestRegionMatch;
-  // best mathcing basic blocks, if regions do not exist
-  std::pair<BasicBlock *, BasicBlock *> BestBbMatch{nullptr, nullptr};
-  bool HasBbMatch = false;
-  double BestBbMatchSimilarityScore = 0.0;
-
+  /// find regions that can be melded in true and false paths of the divergent
+  /// block
   void findMergeableRegions(BasicBlock &BB);
-  BasicBlock *findMostSimilarBb(BasicBlock *BB,
-                                SmallVectorImpl<BasicBlock *> &Candidates);
   /// Find mergeable blocks in 'Regions' that are not contained inside local
   /// loops
   void findMergeableBBsInRegions(BasicBlock *From,
                                  SmallVectorImpl<Region *> &Regions,
                                  SmallVectorImpl<BasicBlock *> &MergeableBBs);
 
+  /// always pick the most profitable region pair first
   void computeGreedyRegionMatch();
+  /// align all regions based on profitability
   void computeSARegionMatch();
+
+  // result of the analysis
+  RegionAnalysisResult Result;
 
 public:
   RegionAnalyzer(BasicBlock *BB, ControlFlowGraphInfo &CFGInfo);
 
   void computeRegionMatch();
 
-  // region analyzer's result
-  DenseMap<BasicBlock *, BasicBlock *> getRegionMatch(unsigned Index);
-  std::pair<BasicBlock *, BasicBlock *>
-  getRegionMatchEntryBlocks(unsigned Index);
-  std::pair<BasicBlock *, BasicBlock *>
-  getRegionMatchExitBlocks(unsigned Index);
-  // bool isInsideRegionMatch(BasicBlock *BB, unsigned Index);
-  bool hasAnyProfitableMatch();
-  bool isRegionMatchProfitable(unsigned Index);
-  unsigned regionMatchSize() const;
-  unsigned getMostProfitableRegionMatchIndex();
-
-  // region replication, only applicable for BB-region melding
-  bool requireRegionReplication();
-
-  bool requireRegionSimplification(Region *R);
+  RegionAnalysisResult &getResult() { return Result; }
 
   /// infomation about divergent region
   Value *getDivergentCondition() const { return DivergentCondition; }

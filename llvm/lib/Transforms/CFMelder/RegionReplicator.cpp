@@ -26,8 +26,8 @@ Region *RegionReplicator::replicate(BasicBlock *ExpandedBlock,
 
   // errs() << "recompute CF analysis\n";
   // recompute CF analysis
-  MA.getCFGInfo().recompute();
-  auto RI = MA.getCFGInfo().getRegionInfo();
+  CFGInfo.recompute();
+  auto RI = CFGInfo.getRegionInfo();
 
   Region *ReplicatedR = Utils::getRegionWithEntryExit(
       *RI, RepEntryExitPair.first, RepEntryExitPair.second);
@@ -134,15 +134,15 @@ RegionReplicator::replicateCFG(BasicBlock *ExpandedBlock,
         ExpandedBlock->getTerminator()->eraseFromParent();
         BranchInst::Create(ExpandedBlock, ExpandedBlock,
                            ConstantInt::getTrue(Type::getInt1Ty(
-                               MA.getParentFunction()->getContext())),
+                               CFGInfo.getFunction().getContext())),
                            ExpandedBlock);
       }
     }
     // if not replicate the basic block
     else {
       ReplicatedBB =
-          BasicBlock::Create(MA.getParentFunction()->getContext(),
-                             "replicated.bb", MA.getParentFunction());
+          BasicBlock::Create(CFGInfo.getFunction().getContext(),
+                             "replicated.bb", &CFGInfo.getFunction());
       // add a  branch
       if (dyn_cast<BranchInst>(Curr->getTerminator())->isUnconditional()) {
         BranchInst::Create(ExpandedBlock, ReplicatedBB);
@@ -150,7 +150,7 @@ RegionReplicator::replicateCFG(BasicBlock *ExpandedBlock,
         // set branching condition to true, and concretize later
         BranchInst::Create(ExpandedBlock, ExpandedBlock,
                            ConstantInt::getTrue(Type::getInt1Ty(
-                               MA.getParentFunction()->getContext())),
+                               CFGInfo.getFunction().getContext())),
                            ReplicatedBB);
       }
     }
@@ -240,10 +240,10 @@ void RegionReplicator::fullPredicateStores(Region *RToReplicate,
       // add a select to pick the right value to store
       Value *SelectI = nullptr;
       if (IsExpandingLeft) {
-        SelectI = SelectInst::Create(MA.getDivergentCondition(), OldData,
+        SelectI = SelectInst::Create(DivergentCond, OldData,
                                      NewData, "rr.store.sel", SI);
       } else {
-        SelectI = SelectInst::Create(MA.getDivergentCondition(), NewData,
+        SelectI = SelectInst::Create(DivergentCond, NewData,
                                      OldData, "rr.store.sel", SI);
       }
       // give right value to store
@@ -269,7 +269,7 @@ void RegionReplicator::addPhiNodes(BasicBlock *ExpandedBlock,
   // };
   // errs() << "computing DF\n";
   // compute DF
-  DominatorTree &DT = MA.getCFGInfo().getDomTree();
+  DominatorTree &DT = CFGInfo.getDomTree();
   DominanceFrontier DF;
   DF.analyze(DT);
 
@@ -428,9 +428,9 @@ void RegionReplicator::concretizeBranchConditions(BasicBlock *ExpandedBlock,
 
   // concretize the branch conditions along the found path
   Value *TrueV = ConstantInt::getTrue(
-      Type::getInt1Ty(MA.getParentFunction()->getContext()));
+      Type::getInt1Ty(CFGInfo.getFunction().getContext()));
   Value *FalseV = ConstantInt::getFalse(
-      Type::getInt1Ty(MA.getParentFunction()->getContext()));
+      Type::getInt1Ty(CFGInfo.getFunction().getContext()));
   for (unsigned BBIdx = 0; BBIdx < BestPath.size() - 1; BBIdx++) {
     BasicBlock *BB = BestPath[BBIdx];
     BasicBlock *BBNext = BestPath[BBIdx + 1];
@@ -446,8 +446,8 @@ void RegionReplicator::concretizeBranchConditions(BasicBlock *ExpandedBlock,
   // find broken def-use chains for all defs in expanded block
   BasicBlock *BestPathSecondExit = BestPath[BestPath.size() - 2];
   SmallVector<std::pair<Instruction *, Instruction *>> BrokenDefUsers;
-  DominatorTree &DT = MA.getCFGInfo().getDomTree();
-  PostDominatorTree &PDT = MA.getCFGInfo().getPostDomTree();
+  DominatorTree &DT = CFGInfo.getDomTree();
+  PostDominatorTree &PDT = CFGInfo.getPostDomTree();
 
   // checks if a given instruction is inside replicated region
   auto IsInsideReplicatedRegion = [&](Instruction *I) -> bool {

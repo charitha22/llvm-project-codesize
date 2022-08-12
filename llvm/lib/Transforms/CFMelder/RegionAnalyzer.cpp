@@ -3,6 +3,7 @@
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/CodeGen/DIE.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/MCA/HardwareUnits/RetireControlUnit.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
@@ -28,6 +29,52 @@ static cl::opt<bool> DisableRegionReplication(
 static cl::opt<bool>
     RunBranchFusionOnly("run-branch-fusion-only", cl::init(false), cl::Hidden,
                         cl::desc("Run branch fusion only, no region-melding"));
+
+// helper functions
+
+// finds the most similar block in 'Candidates' to block BB
+static BasicBlock *
+findMostSimilarBb(BasicBlock *BB, SmallVectorImpl<BasicBlock *> &Candidates) {
+  assert(Candidates.size() > 0 && "empty basicblock candidate list!");
+  BasicBlock *MostSimilar = Candidates[0];
+  double BestScore = Utils::computeBlockSimilarity(BB, MostSimilar);
+  for (BasicBlock *Candidate : Candidates) {
+    double Score = Utils::computeBlockSimilarity(BB, Candidate);
+    if (Score > BestScore) {
+      MostSimilar = Candidate;
+      BestScore = Score;
+    }
+  }
+
+  return MostSimilar;
+}
+
+static void printRegionList(SmallVectorImpl<Region *> &Regions,
+                            DominatorTree &DT) {
+  for (auto It = Regions.begin(); It != Regions.end(); It++) {
+
+    errs() << "[ ";
+    (*It)->getEntry()->printAsOperand(errs(), false);
+    errs() << " : ";
+    (*It)->getExit()->printAsOperand(errs(), false);
+    errs() << " ]";
+  }
+}
+
+// check if region list is in dominance order
+static bool verifyRegionList(SmallVectorImpl<Region *> &Regions,
+                             DominatorTree &DT) {
+  for (auto It = Regions.begin(); It != Regions.end(); It++) {
+    // check if the list is in dominance order
+    if ((It + 1) != Regions.end()) {
+      Region *Curr = *It;
+      Region *Next = *(It + 1);
+      if (!DT.dominates(Curr->getEntry(), Next->getEntry()))
+        return false;
+    }
+  }
+  return true;
+}
 
 void ControlFlowGraphInfo::recompute() {
   DT.recalculate(getFunction());
@@ -165,9 +212,9 @@ void RegionAnalyzer::computeSARegionMatch() {
   auto SMSA =
       SmithWaterman<Region *, SmallVectorImpl<Region *>, nullptr>(ScoringFunc);
 
-  auto Result = SMSA.compute(LeftRegions, RightRegions);
+  auto RegionAlignment = SMSA.compute(LeftRegions, RightRegions);
   int AlignedReginPairs = 0;
-  for (auto Entry : Result) {
+  for (auto Entry : RegionAlignment) {
     Region *L = Entry.getLeft();
     Region *R = Entry.getRight();
     if (Entry.match()) {
@@ -177,7 +224,7 @@ void RegionAnalyzer::computeSARegionMatch() {
       std::shared_ptr<MergeableRegionPair> RegionPair =
           std::make_shared<MergeableRegionPair>(*L, *R, RC);
 
-      BestRegionMatch.push_back(RegionPair);
+      Result.BestRegionMatch.push_back(RegionPair);
       AlignedReginPairs++;
     }
   }
@@ -222,7 +269,7 @@ void RegionAnalyzer::computeGreedyRegionMatch() {
 
   // add the most profitable match first
   if (MergeableRegionPairs.size() > 0) {
-    BestRegionMatch.push_back(MergeableRegionPairs[0]);
+    Result.BestRegionMatch.push_back(MergeableRegionPairs[0]);
   }
 
   // then add next best mergeable pair given that prev best dominates
@@ -230,10 +277,10 @@ void RegionAnalyzer::computeGreedyRegionMatch() {
   for (unsigned I = 1; I < MergeableRegionPairs.size(); I++) {
     auto &MRPair = MergeableRegionPairs[I];
 
-    auto &CurrBest = BestRegionMatch[BestRegionMatch.size() - 1];
+    auto &CurrBest = Result.BestRegionMatch.back();
 
     if (CurrBest->dominates(MRPair, DT))
-      BestRegionMatch.push_back(MRPair);
+      Result.BestRegionMatch.push_back(MRPair);
   }
 }
 
@@ -242,22 +289,27 @@ void RegionAnalyzer::computeRegionMatch() {
   BasicBlock *LeftEntry = DivergentBB->getTerminator()->getSuccessor(0);
   BasicBlock *RightEntry = DivergentBB->getTerminator()->getSuccessor(1);
 
+  Result.DivBlock = DivergentBB;
+
   // running branch fusion only
   if (RunBranchFusionOnly) {
     BasicBlock *LeftUniqueSucc = LeftEntry->getUniqueSuccessor();
     BasicBlock *RightUniqueSucc = RightEntry->getUniqueSuccessor();
     if (LeftUniqueSucc && RightUniqueSucc &&
         LeftUniqueSucc == RightUniqueSucc) {
-      BestBbMatchSimilarityScore =
+      Result.BestBbMatchSimilarityScore =
           Utils::computeBlockSimilarity(LeftEntry, RightEntry);
       DEBUG << "Branch fusion can be applied to basic blocks ";
       LeftEntry->printAsOperand(errs(), false);
       errs() << ", ";
       RightEntry->printAsOperand(errs(), false);
-      errs() << ", similarity score" << BestBbMatchSimilarityScore << "\n";
-      BestBbMatch.first = LeftEntry;
-      BestBbMatch.second = RightEntry;
-      HasBbMatch = true;
+      errs() << ", similarity score" << Result.BestBbMatchSimilarityScore
+             << "\n";
+      Result.BestBbMatch.first = LeftEntry;
+      Result.BestBbMatch.second = RightEntry;
+      Result.HasBlockMatch = true;
+      // this does not need region replication
+      Result.RequireRegionReplication = false;
     }
     return;
   }
@@ -267,18 +319,20 @@ void RegionAnalyzer::computeRegionMatch() {
 
   // Case 1 : No regions found. L and R paths have single BB
   if (LeftRegions.empty() && RightRegions.empty()) {
-    BestBbMatchSimilarityScore =
+    Result.BestBbMatchSimilarityScore =
         Utils::computeBlockSimilarity(LeftEntry, RightEntry);
     DEBUG << "Basic blocks ";
     LeftEntry->printAsOperand(errs(), false);
     errs() << ", ";
     RightEntry->printAsOperand(errs(), false);
-    errs() << " can be melded, similarity score " << BestBbMatchSimilarityScore
-           << "\n";
+    errs() << " can be melded, similarity score "
+           << Result.BestBbMatchSimilarityScore << "\n";
 
-    BestBbMatch.first = LeftEntry;
-    BestBbMatch.second = RightEntry;
-    HasBbMatch = true;
+    Result.BestBbMatch.first = LeftEntry;
+    Result.BestBbMatch.second = RightEntry;
+    Result.HasBlockMatch = true;
+    // this does not need region replication
+    Result.RequireRegionReplication = false;
     return;
   }
 
@@ -286,10 +340,10 @@ void RegionAnalyzer::computeRegionMatch() {
   if (LeftRegions.empty() || RightRegions.empty()) {
 
     if (LeftRegions.empty()) {
-      BestBbMatch.first = LeftEntry;
+      Result.BestBbMatch.first = LeftEntry;
     }
     if (RightRegions.empty()) {
-      BestBbMatch.second = RightEntry;
+      Result.BestBbMatch.second = RightEntry;
     }
 
     PostDominatorTree &PDT = getCFGInfo().getPostDomTree();
@@ -300,15 +354,15 @@ void RegionAnalyzer::computeRegionMatch() {
 
     Region *ReplicatedRegion = nullptr;
 
-    if (!BestBbMatch.first) {
-      assert(LeftRegions.size() > 0 && BestBbMatch.second);
+    if (!Result.BestBbMatch.first) {
+      assert(LeftRegions.size() > 0 && Result.BestBbMatch.second);
       findMergeableBBsInRegions(LeftEntry, LeftRegions, MergeableBlocks);
       if (MergeableBlocks.size()) {
-        BestBbMatch.first =
-            findMostSimilarBb(BestBbMatch.second, MergeableBlocks);
+        Result.BestBbMatch.first =
+            findMostSimilarBb(Result.BestBbMatch.second, MergeableBlocks);
 
         for (auto *R : LeftRegions) {
-          if (R->contains(BestBbMatch.first)) {
+          if (R->contains(Result.BestBbMatch.first)) {
             ReplicatedRegion = R;
             break;
           }
@@ -316,15 +370,15 @@ void RegionAnalyzer::computeRegionMatch() {
       }
     }
 
-    if (!BestBbMatch.second) {
-      assert(RightRegions.size() > 0 && BestBbMatch.first);
+    if (!Result.BestBbMatch.second) {
+      assert(RightRegions.size() > 0 && Result.BestBbMatch.first);
       MergeableBlocks.clear();
       findMergeableBBsInRegions(RightEntry, RightRegions, MergeableBlocks);
       if (MergeableBlocks.size()) {
-        BestBbMatch.second =
-            findMostSimilarBb(BestBbMatch.first, MergeableBlocks);
+        Result.BestBbMatch.second =
+            findMostSimilarBb(Result.BestBbMatch.first, MergeableBlocks);
         for (auto *R : RightRegions) {
-          if (R->contains(BestBbMatch.second)) {
+          if (R->contains(Result.BestBbMatch.second)) {
             ReplicatedRegion = R;
             break;
           }
@@ -332,17 +386,25 @@ void RegionAnalyzer::computeRegionMatch() {
       }
     }
 
-    // if profitable match is found
-    if (BestBbMatch.first && BestBbMatch.second) {
-      HasBbMatch = true;
+    BasicBlock *L = Result.BestBbMatch.first;
+    BasicBlock *R = Result.BestBbMatch.second;
 
-      BasicBlock *L = BestBbMatch.first;
-      BasicBlock *R = BestBbMatch.second;
+    // if profitable match is found
+    if (L && R) {
+      Result.HasBlockMatch = true;
 
       DEBUG << "Block to region melding is possible with blocks "
             << Utils::getNameStr(L) << ", " << Utils::getNameStr(R) << "\n";
 
-      if (requireRegionReplication()) {
+      // decide if this needs region replicatoin
+      BasicBlock *LeftEntry = DivergentBB->getTerminator()->getSuccessor(0);
+      BasicBlock *RightEntry = DivergentBB->getTerminator()->getSuccessor(1);
+      PostDominatorTree &PDT = getCFGInfo().getPostDomTree();
+
+      Result.RequireRegionReplication =
+          !PDT.dominates(L, LeftEntry) || !PDT.dominates(R, RightEntry);
+
+      if (Result.RequireRegionReplication) {
         // utility function to get branch cost
         auto GetBrCost = [&]() -> int {
           return getCFGInfo()
@@ -352,16 +414,16 @@ void RegionAnalyzer::computeRegionMatch() {
               .getValue();
         };
         DEBUG << "Melding requires region replication\n";
-        BestBbMatchSimilarityScore = Utils::computeBlockSimilarity(
-            BestBbMatch.first, BestBbMatch.second, ReplicatedRegion, GetBrCost);
-            // BestBbMatch.first, BestBbMatch.second);
+        Result.BestBbMatchSimilarityScore =
+            Utils::computeBlockSimilarity(L, R, ReplicatedRegion, GetBrCost);
+        // BestBbMatch.first, BestBbMatch.second);
 
       } else {
-        BestBbMatchSimilarityScore = Utils::computeBlockSimilarity(
-            BestBbMatch.first, BestBbMatch.second);
+        Result.BestBbMatchSimilarityScore = Utils::computeBlockSimilarity(L, R);
       }
 
-      DEBUG << "Similarity score = " << BestBbMatchSimilarityScore << "\n";
+      DEBUG << "Similarity score = " << Result.BestBbMatchSimilarityScore
+            << "\n";
     }
 
     return;
@@ -372,53 +434,10 @@ void RegionAnalyzer::computeRegionMatch() {
     computeSARegionMatch();
 
   DEBUG << "Region pairs in profitabilty order  \n";
-  for (unsigned I = 0; I < BestRegionMatch.size(); ++I) {
-    auto BestPair = BestRegionMatch[I];
+  for (unsigned I = 0; I < Result.BestRegionMatch.size(); ++I) {
+    auto BestPair = Result.BestRegionMatch[I];
     DEBUG << *BestPair
           << ", similarity score = " << BestPair->getSimilarityScore() << "\n";
-  }
-}
-
-BasicBlock *
-RegionAnalyzer::findMostSimilarBb(BasicBlock *BB,
-                                  SmallVectorImpl<BasicBlock *> &Candidates) {
-  assert(Candidates.size() > 0 && "empty basicblock candidate list!");
-  BasicBlock *MostSimilar = Candidates[0];
-  double BestScore = Utils::computeBlockSimilarity(BB, MostSimilar);
-  // MergeableRegionPair::ComputeBBSimilarity(BB, candidates[0]);
-  for (BasicBlock *Candidate : Candidates) {
-    double Score = Utils::computeBlockSimilarity(BB, Candidate);
-    if (Score > BestScore) {
-      MostSimilar = Candidate;
-      BestScore = Score;
-    }
-  }
-
-  return MostSimilar;
-}
-
-// check if region list is in dominance order
-bool verifyRegionList(SmallVectorImpl<Region *> &Regions, DominatorTree &DT) {
-  for (auto It = Regions.begin(); It != Regions.end(); It++) {
-    // check if the list is in dominance order
-    if ((It + 1) != Regions.end()) {
-      Region *Curr = *It;
-      Region *Next = *(It + 1);
-      if (!DT.dominates(Curr->getEntry(), Next->getEntry()))
-        return false;
-    }
-  }
-  return true;
-}
-
-void printRegionList(SmallVectorImpl<Region *> &Regions, DominatorTree &DT) {
-  for (auto It = Regions.begin(); It != Regions.end(); It++) {
-
-    errs() << "[ ";
-    (*It)->getEntry()->printAsOperand(errs(), false);
-    errs() << " : ";
-    (*It)->getExit()->printAsOperand(errs(), false);
-    errs() << " ]";
   }
 }
 
@@ -529,16 +548,18 @@ void RegionAnalyzer::findMergeableRegions(BasicBlock &BB) {
          "Right regions are not in dominance order!");
 }
 
-unsigned RegionAnalyzer::regionMatchSize() const {
-  if (HasBbMatch)
+void RegionAnalyzer::printAnalysis(llvm::raw_ostream &OS) { Result.print(OS); }
+
+unsigned RegionAnalysisResult::regionMatchSize() const {
+  if (HasBlockMatch)
     return 1;
   return BestRegionMatch.size();
 }
 
 std::pair<BasicBlock *, BasicBlock *>
-RegionAnalyzer::getRegionMatchEntryBlocks(unsigned I) {
+RegionAnalysisResult::getRegionMatchEntryBlocks(unsigned I) {
 
-  if (HasBbMatch)
+  if (HasBlockMatch)
     return BestBbMatch;
   std::shared_ptr<MergeableRegionPair> RP = BestRegionMatch[I];
 
@@ -547,9 +568,9 @@ RegionAnalyzer::getRegionMatchEntryBlocks(unsigned I) {
 }
 
 std::pair<BasicBlock *, BasicBlock *>
-RegionAnalyzer::getRegionMatchExitBlocks(unsigned I) {
+RegionAnalysisResult::getRegionMatchExitBlocks(unsigned I) {
   // for single BB match exit block is null
-  if (HasBbMatch)
+  if (HasBlockMatch)
     return std::pair<BasicBlock *, BasicBlock *>(nullptr, nullptr);
   std::shared_ptr<MergeableRegionPair> RP = BestRegionMatch[I];
 
@@ -558,10 +579,10 @@ RegionAnalyzer::getRegionMatchExitBlocks(unsigned I) {
 }
 
 DenseMap<BasicBlock *, BasicBlock *>
-RegionAnalyzer::getRegionMatch(unsigned I) {
+RegionAnalysisResult::getRegionMatch(unsigned I) {
   DenseMap<BasicBlock *, BasicBlock *> BbMap;
 
-  if (HasBbMatch) {
+  if (HasBlockMatch) {
     assert(I == 0 && "only one basicblock match is expected");
     BbMap.insert(BestBbMatch);
     return BbMap;
@@ -604,36 +625,8 @@ RegionAnalyzer::getRegionMatch(unsigned I) {
   return BbMap;
 }
 
-// if the region's exit has predecessors from outside the region
-// region needs a simplification
-bool RegionAnalyzer::requireRegionSimplification(Region *R) {
-  BasicBlock *Exit = R->getExit();
-  for (auto PredIt = pred_begin(Exit); PredIt != pred_end(Exit); ++PredIt) {
-    BasicBlock *Pred = *PredIt;
-    if (!R->contains(Pred))
-      return true;
-  }
-  return false;
-}
-
-// this function checks if the melding requires a region replication
-// this occurs when we have to do a BB-Region meld.
-// The matching basic block is inside the region but it does not post-dominate
-// the entry.
-bool RegionAnalyzer::requireRegionReplication() {
-  if (!HasBbMatch)
-    return false;
-  BasicBlock *L = BestBbMatch.first;
-  BasicBlock *R = BestBbMatch.second;
-  BasicBlock *LeftEntry = DivergentBB->getTerminator()->getSuccessor(0);
-  BasicBlock *RightEntry = DivergentBB->getTerminator()->getSuccessor(1);
-  PostDominatorTree &PDT = getCFGInfo().getPostDomTree();
-
-  return !PDT.dominates(L, LeftEntry) || !PDT.dominates(R, RightEntry);
-}
-
-unsigned RegionAnalyzer::getMostProfitableRegionMatchIndex() {
-  if (HasBbMatch)
+unsigned RegionAnalysisResult::getMostProfitableRegionMatchIndex() {
+  if (HasBlockMatch)
     return 0;
 
   double MaxProfit = 0.0;
@@ -647,44 +640,8 @@ unsigned RegionAnalyzer::getMostProfitableRegionMatchIndex() {
   return MaxIndex;
 }
 
-bool RegionAnalyzer::hasAnyProfitableMatch() {
-  if (HasBbMatch) {
-    // FIXME : if this requires region replication we need to be careful about
-    // store instructions. avoid doing RR is stroe instructions are present in
-    // other blocks for now
-    // if (requireRegionReplication()) {
-    //   Region *ReplicateR = nullptr;
-    //   BasicBlock* BBInsideRegion = nullptr;
-    //   BasicBlock *L = BestBbMatch.first;
-    //   BasicBlock *R = BestBbMatch.second;
-    //   BasicBlock *LeftEntry = DivergentBB->getTerminator()->getSuccessor(0);
-    //   BasicBlock *RightEntry = DivergentBB->getTerminator()->getSuccessor(1);
-
-    //   if (getPDT()->dominates(L, LeftEntry)) {
-    //     ReplicateR = getRI()->getRegionFor(R);
-    //     BBInsideRegion = R;
-    //   }
-    //   else {
-    //     ReplicateR = getRI()->getRegionFor(L);
-    //     BBInsideRegion = L;
-
-    //   }
-
-    //   // check if replicated region contains store instructions outside the
-    //   melded blocks
-    //   // if it does don't meld for now
-    //   for(auto *BB : ReplicateR->blocks()){
-    //     if (BB == BBInsideRegion) continue;
-    //     for (auto &I : *BB) {
-    //       if(isa<StoreInst>(&I)) {
-    //         DEBUG << "Replicated region contains store instructions outside
-    //         melded block, no melding performed!\n"; return false;
-    //       }
-    //     }
-    //   }
-
-    // }
-
+bool RegionAnalysisResult::hasAnyProfitableMatch() {
+  if (HasBlockMatch) {
     // if merging 2 basic blocks, avoid merging single branch blocks (size > 1)
     return BestBbMatchSimilarityScore >= SimilarityThreshold &&
            (BestBbMatch.first->size() > 1 && BestBbMatch.second->size() > 1);
@@ -696,47 +653,53 @@ bool RegionAnalyzer::hasAnyProfitableMatch() {
         return true;
     }
   }
-
   return false;
 }
 
-bool RegionAnalyzer::isRegionMatchProfitable(unsigned Index) {
+bool RegionAnalysisResult::isRegionMatchProfitable(unsigned Index) {
   assert(Index < regionMatchSize() && "Region match index out of bounds!");
-  if (HasBbMatch) {
+  if (HasBlockMatch) {
     return hasAnyProfitableMatch();
   }
   return BestRegionMatch[Index]->getSimilarityScore() >= SimilarityThreshold;
 }
 
-void RegionAnalyzer::printAnalysis(llvm::raw_ostream &Os) {
-  if (HasBbMatch) {
-    Os << "Similarity Score : " << BestBbMatchSimilarityScore << "\n";
-    Os << "Merge at BB level : \n"
+void RegionAnalysisResult::print(llvm::raw_ostream &OS) {
+  if (HasBlockMatch) {
+    OS << "Similarity Score : " << BestBbMatchSimilarityScore << "\n";
+    OS << "Merge at BB level : \n"
        << "   merging BB ";
-    BestBbMatch.first->printAsOperand(Os, false);
-    Os << " with  ";
+    BestBbMatch.first->printAsOperand(OS, false);
+    OS << " with  ";
     BestBbMatch.second->printAsOperand(errs(), false);
-    Os << "   requires " << (requireRegionReplication() ? "" : " no ")
+    OS << "   requires " << (requireRegionReplication() ? "" : " no ")
        << "region replication\n";
 
   } else if (BestRegionMatch.size() > 0) {
-    Os << "Merge at REGION level : \n";
+    OS << "Merge at REGION level : \n";
     for (unsigned I = 0; I < BestRegionMatch.size(); I++) {
-      Os << "Index : " << I << "\n";
-      Os << "Similarity Score : " << BestRegionMatch[I]->getSimilarityScore()
+      OS << "Index : " << I << "\n";
+      OS << "Similarity Score : " << BestRegionMatch[I]->getSimilarityScore()
          << "\n"
          << "   merging region entry ";
       BestRegionMatch[I]->getLeftEntry()->printAsOperand(errs(), false);
-      Os << " with "
+      OS << " with "
          << " region entry ";
       BestRegionMatch[I]->getRightEntry()->printAsOperand(errs(), false);
-      Os << "\n"
+      OS << "\n"
          << "   merging region exit ";
       BestRegionMatch[I]->getLeftExit()->printAsOperand(errs(), false);
-      Os << " with "
+      OS << " with "
          << " region exit ";
       BestRegionMatch[I]->getRightExit()->printAsOperand(errs(), false);
-      Os << "\n";
+      OS << "\n";
     }
   }
+}
+
+Value *RegionAnalysisResult::getDivCondition() {
+  BranchInst *BI = dyn_cast<BranchInst>(DivBlock->getTerminator());
+  assert(BI->isConditional() &&
+         "No conditional branch at the end of divergent block!");
+  return BI->getCondition();
 }

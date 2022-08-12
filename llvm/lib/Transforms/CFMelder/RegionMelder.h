@@ -5,9 +5,12 @@
 #include "SmithWaterman.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/ValueMap.h"
 #include "llvm/TableGen/Record.h"
 #include "llvm/Transforms/IPO/FunctionMerging.h"
@@ -43,10 +46,10 @@ public:
     int SavedSize = 0;
     if (isa<Instruction>(V1)) {
       SavedSize = 1 + TTI->getInstructionCost(
-                         dyn_cast<Instruction>(V1),
-                         TargetTransformInfo::TargetCostKind::TCK_CodeSize)
-                      .getValue()
-                      .getValue();
+                             dyn_cast<Instruction>(V1),
+                             TargetTransformInfo::TargetCostKind::TCK_CodeSize)
+                          .getValue()
+                          .getValue();
     } else if (isa<BasicBlock>(V1)) {
       SavedSize = 3;
     }
@@ -54,10 +57,10 @@ public:
   }
 
   int gap(int K) override {
-    int BrCost = TTI
-        ->getCFInstrCost(Instruction::Br, TTI::TargetCostKind::TCK_CodeSize)
-        .getValue()
-        .getValue();
+    int BrCost =
+        TTI->getCFInstrCost(Instruction::Br, TTI::TargetCostKind::TCK_CodeSize)
+            .getValue()
+            .getValue();
     return 1 + BrCost;
   }
 };
@@ -83,15 +86,30 @@ public:
   int gap(int K) override { return 2; }
 };
 
-class RegionMelder {
-private:
-  RegionAnalyzer &MA;
+struct RegionMeldingInfo {
+public:
+  BasicBlock *LEntry{nullptr}, *REntry{nullptr};
+  BasicBlock *LExit{nullptr}, *RExit{nullptr};
+  bool RegionsSimplified = false;
+  DenseMap<BasicBlock *, BasicBlock *> BlockMap;
+  BasicBlock *UnifyPHIBlock{nullptr};
+  bool ExpandingLeft = false;
+  // Expanded Block
+  BasicBlock *ExpandedBlock = nullptr;
+  // predecessors of melded regions
+  SmallVector<BasicBlock *> LPreds, RPreds;
+  // successors of melded regions
+  SmallVector<BasicBlock *> LSuccs, RSuccs;
+  void updateBlockMap(BasicBlock *New, BasicBlock *Old, bool IsLeft);
+  void print();
+};
 
-  // entry and exits of currently merging regions
-  // if single BB, exit is null
-  BasicBlock *EntryBlockL{nullptr}, *EntryBlockR{nullptr};
-  BasicBlock *ExitBlockL{nullptr}, *ExitBlockR{nullptr};
-  DenseMap<BasicBlock *, BasicBlock *> CurrMapping;
+class MeldingHandler {
+private:
+  Function *Func{nullptr};
+  Value *DivCond{nullptr};
+  TargetTransformInfo &TTI;
+  RegionMeldingInfo &MeldingInfo;
 
   AlignedSeq<Value *> RegionInstrAlignement;
   using ValueToValueMapTy = ValueMap<const Value *, WeakTrackingVH>;
@@ -160,18 +178,36 @@ private:
   void fixPhiNode(PHINode *Orig);
   void runPostOptimizations();
   void setOprendsForNonMatchingStore(StoreInst *SI, bool IsLeft);
-  void runPreMergePasses(bool RegionAlreadySimplified);
-  void mergeOutsideDefsAtEntry();
+
+  void runUnpredicationPass();
+  void updateSplitRangeMap(bool Direction, Instruction *I);
+public:
+  MeldingHandler(Function* Func, Value* DivCond, TargetTransformInfo &TTI,
+                 RegionMeldingInfo &MeldInfo)
+      : Func(Func), DivCond(DivCond),
+        TTI(TTI), MeldingInfo(MeldInfo) {}
+  /// merge two SESE regions (or SESE basic blocks)
+  void meld();
+};
+
+class RegionMelder {
+private:
+  ControlFlowGraphInfo &CFGInfo;
+  RegionAnalysisResult &RAResult;
+  RegionMeldingInfo MeldInfo;
+
+  void runRegionReplication();
+  BasicBlock *addUnifyPHIBlock();
+  void simplifyRegions();
+
+  /// undo the changes done in preprocess
+  void undoPreprocess();
 
   // makes the region SESE, after simplification exit block of the region
   // is connected to rest of the CFG with only one edge
   BasicBlock *simplifyRegion(BasicBlock *Exit, BasicBlock *Entry);
 
-  bool isExitBlockSafeToMerge(BasicBlock *Exit, BasicBlock *Entry);
   void updateMapping(BasicBlock *NewBb, BasicBlock *OldBb, bool IsLeft);
-
-  void runUnpredicationPass();
-  void updateSplitRangeMap(bool Direction, Instruction *I);
 
   bool isInsideMeldedRegion(BasicBlock *BB, BasicBlock *Entry,
                             BasicBlock *Exit);
@@ -180,9 +216,11 @@ private:
   Region *getRegionToReplicate(BasicBlock *MatchedBlock, BasicBlock *PathEntry);
 
 public:
-  RegionMelder(RegionAnalyzer &MA) : MA(MA) {}
-  // meld I'th region pair
-  void merge(unsigned Index);
+  RegionMelder(ControlFlowGraphInfo &CFGInfo, RegionAnalysisResult &RAResult)
+      : CFGInfo(CFGInfo), RAResult(RAResult) {}
+  /// perform melding on most profitable region pair
+  /// returns true if size reduction was positive
+  bool run();
 };
 
 } // namespace llvm

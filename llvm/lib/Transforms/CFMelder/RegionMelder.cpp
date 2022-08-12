@@ -1,10 +1,12 @@
 #include "RegionMelder.h"
 #include "CFMelderUtils.h"
+#include "RegionAnalyzer.h"
 #include "RegionReplicator.h"
 #include "SeqAlignmentUtils.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/iterator_range.h"
+#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
@@ -47,8 +49,8 @@ STATISTIC(InstrAlignTime,
           "Time spent in instruction alignment in microseconds");
 
 AlignedSeq<Value *>
-RegionMelder::getAlignmentOfBlocks(BasicBlock *LeftBb, BasicBlock *RightBb,
-                                   ScoringFunction<Value *> &ScoringFunc) {
+MeldingHandler::getAlignmentOfBlocks(BasicBlock *LeftBb, BasicBlock *RightBb,
+                                     ScoringFunction<Value *> &ScoringFunc) {
   // do sequence aligment
   SmallVector<Value *, 32> LSeq;
   SmallVector<Value *, 32> RSeq;
@@ -63,11 +65,11 @@ RegionMelder::getAlignmentOfBlocks(BasicBlock *LeftBb, BasicBlock *RightBb,
   return Result;
 }
 
-void RegionMelder::computeRegionSeqAlignment(
+void MeldingHandler::computeRegionSeqAlignment(
     DenseMap<BasicBlock *, BasicBlock *> BbMap) {
 
   shared_ptr<ScoringFunction<Value *>> ScoringFuncSize =
-      make_shared<CodeSizeCostModel>(MA.getCFGInfo().getTTI());
+      make_shared<CodeSizeCostModel>(TTI);
   shared_ptr<ScoringFunction<Value *>> ScoringFuncLat =
       make_shared<GPULatencyCostModel>();
 
@@ -108,10 +110,10 @@ bool requireUnpredication(BasicBlock *Current, BasicBlock *Corresponding) {
   return Corresponding->size() > 1;
 }
 
-void RegionMelder::cloneInstructions() {
+void MeldingHandler::cloneInstructions() {
   INFO << "Cloning instructions\n";
   // generate the control flow for merged region
-  IRBuilder<> Builder(&MA.getParentFunction()->getEntryBlock());
+  IRBuilder<> Builder(&Func->getEntryBlock());
   for (auto &Entry : RegionInstrAlignement) {
 
     Value *LEntry = Entry.get(0);
@@ -121,8 +123,7 @@ void RegionMelder::cloneInstructions() {
         assert(isa<BasicBlock>(REntry) &&
                "Both matching entries must be basic blocks");
         BasicBlock *NewBb =
-            BasicBlock::Create(MA.getParentFunction()->getContext(),
-                               "merged.bb", MA.getParentFunction());
+            BasicBlock::Create(Func->getContext(), "merged.bb", Func);
         // update value map
         MergedValuesToLeftValues[NewBb] = LEntry;
         MergedValuesToRightValues[NewBb] = REntry;
@@ -218,7 +219,7 @@ void RegionMelder::cloneInstructions() {
   }
 }
 
-void RegionMelder::fixPhiNode(PHINode *Orig) {
+void MeldingHandler::fixPhiNode(PHINode *Orig) {
   // orig->print(errs()); errs() << "\n";
   // get the merged phi node
   assert(OrigToMergedValues.find(Orig) != OrigToMergedValues.end() &&
@@ -251,7 +252,7 @@ void RegionMelder::fixPhiNode(PHINode *Orig) {
   }
 }
 
-void RegionMelder::fixOperends() {
+void MeldingHandler::fixOperends() {
   INFO << "Fixing operends\n";
   // set the correct operends in merged instructions
   for (auto &Entry : RegionInstrAlignement) {
@@ -326,12 +327,12 @@ void RegionMelder::fixOperends() {
   }
 }
 
-void RegionMelder::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
-                                    BranchInst *MergedBr) {
+void MeldingHandler::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
+                                      BranchInst *MergedBr) {
 
   // for branches inside the merged regions : pick the correct condition using a
   // select branch labels are set in RAUW phase
-  if (ExitBlockL && LeftBr->getParent() != ExitBlockL) {
+  if (MeldingInfo.LExit && LeftBr->getParent() != MeldingInfo.LExit) {
     assert(LeftBr->getNumSuccessors() == RightBr->getNumSuccessors() &&
            "branches inside the merged region must have same number of "
            "successors!");
@@ -348,8 +349,8 @@ void RegionMelder::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
       // create a select if left and right conditions are not same
       if (LeftCond != RightCond) {
         IRBuilder<> Builder(MergedBr);
-        MergedCond = Builder.CreateSelect(MA.getDivergentCondition(), LeftCond,
-                                          RightCond);
+        MergedCond =
+            Builder.CreateSelect(DivCond, LeftCond, RightCond);
       }
       MergedBr->setCondition(MergedCond);
     }
@@ -362,11 +363,9 @@ void RegionMelder::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
 
   // create two new basic blocks and copy the branches from left and right sides
   BasicBlock *NewBbLeftBr =
-      BasicBlock::Create(MA.getParentFunction()->getContext(),
-                         "merged.branch.split", MA.getParentFunction());
+      BasicBlock::Create(Func->getContext(), "merged.branch.split", Func);
   BasicBlock *NewBbRightBr =
-      BasicBlock::Create(MA.getParentFunction()->getContext(),
-                         "merged.branch.split", MA.getParentFunction());
+      BasicBlock::Create(Func->getContext(), "merged.branch.split", Func);
 
   MergedBBs.push_back(NewBbLeftBr);
   MergedBBs.push_back(NewBbRightBr);
@@ -382,8 +381,8 @@ void RegionMelder::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
   // create a new branch in the merged block to set the targets based on
   // mergepath remove exiting mergeBr
   Builder.SetInsertPoint(MergedBr->getParent());
-  BranchInst *NewBi = Builder.CreateCondBr(MA.getDivergentCondition(),
-                                           NewBbLeftBr, NewBbRightBr);
+  BranchInst *NewBi =
+      Builder.CreateCondBr(DivCond, NewBbLeftBr, NewBbRightBr);
   MergedBr->eraseFromParent();
 
   // update the value maps
@@ -402,7 +401,7 @@ void RegionMelder::setOperendsForBr(BranchInst *LeftBr, BranchInst *RightBr,
   }
 }
 
-void RegionMelder::setOprendsForNonMatchingStore(StoreInst *SI, bool IsLeft) {
+void MeldingHandler::setOprendsForNonMatchingStore(StoreInst *SI, bool IsLeft) {
   // non matching store instructions causes invalid memory write in
   // L or R path. To avoid this we have to add a redundant load that reads the
   // curent value of the address. and depending on the path we pick the correct
@@ -431,7 +430,7 @@ void RegionMelder::setOprendsForNonMatchingStore(StoreInst *SI, bool IsLeft) {
     ValueR = Val;
   }
   Value *ValToStore =
-      Builder.CreateSelect(MA.getDivergentCondition(), ValueL, ValueR);
+      Builder.CreateSelect(DivCond, ValueL, ValueR);
 
   // set the value
   SI->setOperand(0, ValToStore);
@@ -439,8 +438,8 @@ void RegionMelder::setOprendsForNonMatchingStore(StoreInst *SI, bool IsLeft) {
   SI->setOperand(1, Addr);
 }
 
-void RegionMelder::setOperends(Instruction *LeftI, Instruction *RightI,
-                               Instruction *MergedI) {
+void MeldingHandler::setOperends(Instruction *LeftI, Instruction *RightI,
+                                 Instruction *MergedI) {
   for (unsigned I = 0; I < MergedI->getNumOperands(); I++) {
     Value *LeftOp = nullptr, *RightOp = nullptr;
 
@@ -457,9 +456,8 @@ void RegionMelder::setOperends(Instruction *LeftI, Instruction *RightI,
     // if the operends are different add a select to pick the correct one
     Value *NewOp = LeftOp ? LeftOp : RightOp;
     if (LeftOp && RightOp && LeftOp != RightOp) {
-      SelectInst *Select =
-          SelectInst::Create(MA.getDivergentCondition(), LeftOp, RightOp,
-                             "merged.select", MergedI);
+      SelectInst *Select = SelectInst::Create(
+          DivCond, LeftOp, RightOp, "merged.select", MergedI);
       NewOp = dyn_cast<Value>(Select);
     }
 
@@ -468,7 +466,7 @@ void RegionMelder::setOperends(Instruction *LeftI, Instruction *RightI,
   }
 }
 
-void RegionMelder::runPostMergeCleanup() {
+void MeldingHandler::runPostMergeCleanup() {
 
   // replace all uses with merged vals
   // ignore basicblocks
@@ -550,7 +548,7 @@ void RegionMelder::runPostMergeCleanup() {
   // merging can result in additional predessors for merged entry blocks
   // scan all phi nodes and add missing incoming blocks, value will be undef
   // because these transitions will not happen during execution
-  for (auto &BB : *MA.getParentFunction()) {
+  for (auto &BB : *Func) {
     for (PHINode &PN : BB.phis()) {
       for (auto It = pred_begin(&BB); It != pred_end(&BB); ++It) {
         if (PN.getBasicBlockIndex(*It) < 0) {
@@ -565,8 +563,8 @@ void RegionMelder::runPostMergeCleanup() {
 
 Region *RegionMelder::getRegionToReplicate(BasicBlock *MatchedBlock,
                                            BasicBlock *PathEntry) {
-  auto RI = MA.getCFGInfo().getRegionInfo();
-  PostDominatorTree &PDT = MA.getCFGInfo().getPostDomTree();
+  auto RI = CFGInfo.getRegionInfo();
+  PostDominatorTree &PDT = CFGInfo.getPostDomTree();
   BasicBlock *Curr = MatchedBlock;
   Region *R = nullptr;
   do {
@@ -592,30 +590,31 @@ Region *RegionMelder::getRegionToReplicate(BasicBlock *MatchedBlock,
   return R;
 }
 
-void RegionMelder::merge(unsigned Index) {
+bool RegionMelder::run() {
 
   // static int Count = 0;
-  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) + ".cfmelder.");
+  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) +
+  // ".cfmelder.");
 
-  bool RegionAlreadySimplified = false;
+  unsigned BestIndex = RAResult.getMostProfitableRegionMatchIndex();
 
-  if (MA.requireRegionReplication()) {
+  if (RAResult.requireRegionReplication()) {
     INFO << "Replicating regions in BB-region match\n";
-    auto Mapping = MA.getRegionMatch(Index);
+
+    auto Mapping = RAResult.getRegionMatch(BestIndex);
     assert(Mapping.size() == 1 &&
            "more than one pair of basic blocks to match in BB-region match");
 
     // determine on which side region needs to be replicated
-    BasicBlock *LeftPathEntry =
-        MA.getDivergentBlock()->getTerminator()->getSuccessor(0);
-    BasicBlock *RightPathEntry =
-        MA.getDivergentBlock()->getTerminator()->getSuccessor(1);
+    BasicBlock *DivBlock = RAResult.getDivBlock();
+    BasicBlock *LeftPathEntry = DivBlock->getTerminator()->getSuccessor(0);
+    BasicBlock *RightPathEntry = DivBlock->getTerminator()->getSuccessor(1);
 
     BasicBlock *ExpandedBlock, *MatchedBlock = nullptr;
     Region *RToReplicate = nullptr;
     BasicBlock *Left = Mapping.begin()->first, *Right = Mapping.begin()->second;
     bool ExpandingLeft = false;
-    if (MA.getCFGInfo().getPostDomTree().dominates(Left, LeftPathEntry)) {
+    if (CFGInfo.getPostDomTree().dominates(Left, LeftPathEntry)) {
       DEBUG << "Replicating right region\n";
       ExpandedBlock = Left;
       MatchedBlock = Right;
@@ -631,7 +630,7 @@ void RegionMelder::merge(unsigned Index) {
     // simplify the replicated region
     BasicBlock *ExitToReplicate = RToReplicate->getExit();
     BasicBlock *EntryToReplicate = RToReplicate->getEntry();
-    if (MA.requireRegionSimplification(RToReplicate)) {
+    if (Utils::requireRegionSimplification(RToReplicate)) {
       INFO << "Replicated region is not a simple region, running region "
               "simplification\n";
       // BasicBlock *Entry = RToReplicate->getEntry();
@@ -639,9 +638,9 @@ void RegionMelder::merge(unsigned Index) {
           simplifyRegion(RToReplicate->getExit(), RToReplicate->getEntry());
 
       // recompute control-flow analyses , FIXME : this might be too expensive
-      MA.getCFGInfo().recompute();
+      CFGInfo.recompute();
       RToReplicate = Utils::getRegionWithEntryExit(
-          *MA.getCFGInfo().getRegionInfo(), EntryToReplicate, ExitToReplicate);
+          *CFGInfo.getRegionInfo(), EntryToReplicate, ExitToReplicate);
       assert(RToReplicate && "Can not find region with given entry and exit");
 
       INFO << "region after region simplification : ";
@@ -651,49 +650,50 @@ void RegionMelder::merge(unsigned Index) {
       RToReplicate->getExit()->printAsOperand(errs(), false);
       errs() << "]\n";
 
-      RegionAlreadySimplified = true;
+      MeldInfo.RegionsSimplified = true;
     }
 
     // errs() << "replicate the region\n";
     // replicate the region
-    RegionReplicator RR(MA, ExpandingLeft, EnableFullPredication);
+    RegionReplicator RR(CFGInfo, RAResult.getDivCondition(), ExpandingLeft,
+                        EnableFullPredication);
     Region *ReplicatedR =
         RR.replicate(ExpandedBlock, MatchedBlock, RToReplicate);
 
     // errs() << "prepare for melding\n";
     // prepare for melding
     if (ExpandingLeft) {
-      EntryBlockL = ReplicatedR->getEntry();
-      ExitBlockL = ReplicatedR->getExit();
-      EntryBlockR = EntryToReplicate;
-      ExitBlockR = ExitToReplicate;
+      MeldInfo.LEntry = ReplicatedR->getEntry();
+      MeldInfo.LExit = ReplicatedR->getExit();
+      MeldInfo.REntry = EntryToReplicate;
+      MeldInfo.RExit = ExitToReplicate;
     } else {
-      EntryBlockR = ReplicatedR->getEntry();
-      ExitBlockR = ReplicatedR->getExit();
-      EntryBlockL = EntryToReplicate;
-      ExitBlockL = ExitToReplicate;
+      MeldInfo.REntry = ReplicatedR->getEntry();
+      MeldInfo.RExit = ReplicatedR->getExit();
+      MeldInfo.LEntry = EntryToReplicate;
+      MeldInfo.LExit = ExitToReplicate;
     }
 
     // errs() << "here\n";
-    RR.getBasicBlockMapping(CurrMapping, ExpandingLeft);
+    RR.getBasicBlockMapping(MeldInfo.BlockMap, ExpandingLeft);
 
     BBToRegionMeldings++;
 
   } else {
 
     // set entry and exits
-    EntryBlockL = MA.getRegionMatchEntryBlocks(Index).first;
-    EntryBlockR = MA.getRegionMatchEntryBlocks(Index).second;
+    MeldInfo.LEntry = RAResult.getRegionMatchEntryBlocks(BestIndex).first;
+    MeldInfo.REntry = RAResult.getRegionMatchEntryBlocks(BestIndex).second;
 
     // exit blocks are set for only region-region melding, otherwise null
-    auto ExitBlocks = MA.getRegionMatchExitBlocks(Index);
+    auto ExitBlocks = RAResult.getRegionMatchExitBlocks(BestIndex);
     if (ExitBlocks.first && ExitBlocks.second) {
-      ExitBlockL = ExitBlocks.first;
-      ExitBlockR = ExitBlocks.second;
+      MeldInfo.LExit = ExitBlocks.first;
+      MeldInfo.RExit = ExitBlocks.second;
       RegionToRegionMeldings++;
     } else {
-      BasicBlock *LeftUniqueSucc = EntryBlockL->getUniqueSuccessor();
-      BasicBlock *RightUniqueSucc = EntryBlockR->getUniqueSuccessor();
+      BasicBlock *LeftUniqueSucc = MeldInfo.LEntry->getUniqueSuccessor();
+      BasicBlock *RightUniqueSucc = MeldInfo.REntry->getUniqueSuccessor();
       // if diamonf control-flow
       if (LeftUniqueSucc && RightUniqueSucc &&
           LeftUniqueSucc == RightUniqueSucc) {
@@ -703,79 +703,78 @@ void RegionMelder::merge(unsigned Index) {
       }
     }
 
-    CurrMapping = MA.getRegionMatch(Index);
+    MeldInfo.BlockMap = RAResult.getRegionMatch(BestIndex);
   }
 
-  INFO << "Melding entry blocks ";
-  EntryBlockL->printAsOperand(errs(), false);
-  errs() << " , ";
-  EntryBlockR->printAsOperand(errs(), false);
-  errs() << "\n";
-
-  if (ExitBlockL) {
-    INFO << "Melding exit blocks ";
-    ExitBlockL->printAsOperand(errs(), false);
-    errs() << " , ";
-    ExitBlockR->printAsOperand(errs(), false);
-    errs() << "\n";
-  }
+  MeldInfo.print();
   // run pre merge passes
-  runPreMergePasses(RegionAlreadySimplified);
-  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) + ".cfmelder.");
+  simplifyRegions();
+  MeldInfo.UnifyPHIBlock = addUnifyPHIBlock();
+  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) +
+  // ".cfmelder.");
 
   if (!DisableMelding) {
-    // parentFunc->print(errs());
+    MeldingHandler Handler(&CFGInfo.getFunction(), RAResult.getDivCondition(), 
+        CFGInfo.getTTI(), MeldInfo);
     // compute alignment
-#if ENABLE_TIMING == 1
-    auto T1 = std::chrono::high_resolution_clock::now();
-#endif
-    computeRegionSeqAlignment(CurrMapping);
-#if ENABLE_TIMING == 1
-    auto T2 = std::chrono::high_resolution_clock::now();
-    auto micros =
-        std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
-    InstrAlignTime += (unsigned int)(micros);
-#endif
-    // for(auto& Entry : RegionInstrAlignement) {
-    //   if(Entry.getLeft())
-    //     Entry.getLeft()->print(errs());
-    //   else
-    //     errs() << "_";
-    //   errs() << ":";
-    //   if(Entry.getRight())
-    //     Entry.getRight()->print(errs());
-    //   else
-    //     errs() << "_";
-    //   errs() << "\n";
-    // }
-    // while(true);
-
-    // Merge the regions
-    cloneInstructions();
-    fixOperends();
-    runPostMergeCleanup();
-    runPostOptimizations();
-
-    if (!EnableFullPredication)
-      runUnpredicationPass();
+    NumMeldings++;
+    Handler.meld();
   }
-  NumMeldings++;
-  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) + ".cfmelder.");
-  // verify the function
+
+  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) +
+  // ".cfmelder."); verify the function
   // assert(!verifyFunction(*MA.getParentFunction(), &errs()) &&
   //        "function verification failed!");
+  return true;
 }
 
-void RegionMelder::linearizeBb(BasicBlock *BB,
-                               SmallVectorImpl<Value *> &LinearizedVals) {
+void MeldingHandler::meld() {
+  // Utils::writeCFGToDotFile(*Func, ".cfmelder.");
+
+#if ENABLE_TIMING == 1
+  auto T1 = std::chrono::high_resolution_clock::now();
+#endif
+  computeRegionSeqAlignment(MeldingInfo.BlockMap);
+#if ENABLE_TIMING == 1
+  auto T2 = std::chrono::high_resolution_clock::now();
+  auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  InstrAlignTime += (unsigned int)(micros);
+#endif
+  // for(auto& Entry : RegionInstrAlignement) {
+  //   if(Entry.getLeft())
+  //     Entry.getLeft()->print(errs());
+  //   else
+  //     errs() << "_";
+  //   errs() << ":";
+  //   if(Entry.getRight())
+  //     Entry.getRight()->print(errs());
+  //   else
+  //     errs() << "_";
+  //   errs() << "\n";
+  // }
+  // while(true);
+
+  // Merge the regions
+  cloneInstructions();
+  fixOperends();
+  runPostMergeCleanup();
+  runPostOptimizations();
+
+  if (!EnableFullPredication)
+    runUnpredicationPass();
+}
+
+void MeldingHandler::linearizeBb(BasicBlock *BB,
+                                 SmallVectorImpl<Value *> &LinearizedVals) {
   LinearizedVals.push_back(BB);
   for (Instruction &I : *BB) {
     LinearizedVals.push_back(&I);
   }
 }
 
-Instruction *RegionMelder::cloneInstruction(Instruction *OrigI,
-                                            IRBuilder<> &Builder) {
+Instruction *MeldingHandler::cloneInstruction(Instruction *OrigI,
+                                              IRBuilder<> &Builder) {
   Instruction *NewI = OrigI->clone();
 
   BasicBlock *InsertAt = nullptr;
@@ -792,7 +791,9 @@ Instruction *RegionMelder::cloneInstruction(Instruction *OrigI,
   return NewI;
 }
 
-void RegionMelder::runUnpredicationPass() {
+void MeldingHandler::runUnpredicationPass() {
+
+  // Utils::writeCFGToDotFile(*Func, ".cfmelder.");
 
   for (auto &Range : SplitRanges) {
     BasicBlock *BB = Range.getStart()->getParent();
@@ -815,7 +816,7 @@ void RegionMelder::runUnpredicationPass() {
       FalseTarget = SplitBb;
     }
     BranchInst *NewBr = BranchInst::Create(TrueTarget, FalseTarget,
-                                           MA.getDivergentCondition(), BB);
+                                           DivCond, BB);
     OldBr->replaceAllUsesWith(NewBr);
     OldBr->eraseFromParent();
 
@@ -844,7 +845,7 @@ void RegionMelder::runUnpredicationPass() {
   }
 }
 
-void RegionMelder::updateSplitRangeMap(bool Direction, Instruction *I) {
+void MeldingHandler::updateSplitRangeMap(bool Direction, Instruction *I) {
   InstrRange Range(I, I, Direction);
   if (!SplitRanges.empty() && SplitRanges.back().canExtendUsing(Range)) {
     InstrRange Prev = SplitRanges.pop_back_val();
@@ -860,13 +861,13 @@ BasicBlock *RegionMelder::simplifyRegion(BasicBlock *Exit, BasicBlock *Entry) {
   // region create a new exit block and add an edge from new to old exit
 
   // create a new exit block
-  Function *ParentFunc = MA.getParentFunction();
+  Function *ParentFunc = &CFGInfo.getFunction();
   BasicBlock *NewExit = BasicBlock::Create(ParentFunc->getContext(), "new.exit",
                                            ParentFunc, Exit);
   // add a jump from new exit to old exit
   BranchInst::Create(Exit, NewExit);
-  Region *MergedR = Utils::getRegionWithEntryExit(
-      *MA.getCFGInfo().getRegionInfo(), Entry, Exit);
+  Region *MergedR =
+      Utils::getRegionWithEntryExit(*CFGInfo.getRegionInfo(), Entry, Exit);
 
   // this can not be nullptr because must exit
   assert(MergedR && "Can not find region with given entry and exit");
@@ -919,19 +920,23 @@ bool RegionMelder::isInsideMeldedRegion(BasicBlock *BB, BasicBlock *Entry,
     return BB == Entry;
   }
   // melded region has mutiple BBs
-  return (MA.getCFGInfo().getDomTree().dominates(Entry, BB) &&
-          MA.getCFGInfo().getPostDomTree().dominates(Exit, BB));
+  return (CFGInfo.getDomTree().dominates(Entry, BB) &&
+          CFGInfo.getPostDomTree().dominates(Exit, BB));
 }
 
-void RegionMelder::mergeOutsideDefsAtEntry() {
+BasicBlock *RegionMelder::addUnifyPHIBlock() {
 
   SmallVector<BasicBlock *, 16> LeftEntryPreds, RightEntryPreds;
+  BasicBlock *EntryBlockL = MeldInfo.LEntry;
+  BasicBlock *EntryBlockR = MeldInfo.REntry;
+  BasicBlock *ExitBlockL = MeldInfo.LExit;
+  BasicBlock *ExitBlockR = MeldInfo.RExit;
 
   auto CreateUnifyingBB = [&]() {
     BasicBlock *UnifyBB =
-        BasicBlock::Create(MA.getParentFunction()->getContext(), "unify.bb",
-                           MA.getParentFunction(), EntryBlockL);
-    BranchInst::Create(UnifyBB, UnifyBB, MA.getDivergentCondition(), UnifyBB);
+        BasicBlock::Create(CFGInfo.getFunction().getContext(), "unify.bb",
+                           &CFGInfo.getFunction(), MeldInfo.LEntry);
+    BranchInst::Create(UnifyBB, UnifyBB, RAResult.getDivCondition(), UnifyBB);
 
     for (auto &PHI : EntryBlockL->phis()) {
       // add a new phi in unifying block
@@ -1009,18 +1014,15 @@ void RegionMelder::mergeOutsideDefsAtEntry() {
   // create a unifiying basic block
   BasicBlock *UnifyingBB = CreateUnifyingBB();
 
-  // add to mergedBBS
-  MergedBBs.push_back(UnifyingBB);
-
   // recompute control-flow analyses
-  MA.getCFGInfo().recompute();
-  DominatorTree &DT = MA.getCFGInfo().getDomTree();
-  PostDominatorTree &PDT = MA.getCFGInfo().getPostDomTree();
+  CFGInfo.recompute();
+  DominatorTree &DT = CFGInfo.getDomTree();
+  PostDominatorTree &PDT = CFGInfo.getPostDomTree();
 
   // check if there are any def-use chains that are broken
-  for (auto &BB : *MA.getParentFunction()) {
+  for (auto &BB : CFGInfo.getFunction()) {
     // only need to check basic blocks detween top entry and unify BB
-    if (DT.dominates(MA.getDivergentBlock(), &BB) &&
+    if (DT.dominates(RAResult.getDivBlock(), &BB) &&
         PDT.dominates(UnifyingBB, &BB)) {
       // iterate over all users and check for broken def-uses
       for (auto &Def : make_range(BB.begin(), BB.end())) {
@@ -1068,63 +1070,32 @@ void RegionMelder::mergeOutsideDefsAtEntry() {
       }
     }
   }
+  return UnifyingBB;
 }
 
-void RegionMelder::updateMapping(BasicBlock *NewBb, BasicBlock *OldBb,
-                                 bool IsLeft) {
-  auto It = CurrMapping.begin();
-  bool Found = false;
-  for (; It != CurrMapping.end(); ++It) {
-    if (IsLeft) {
-      if (It->first == OldBb) {
+void RegionMelder::simplifyRegions() {
 
-        Found = true;
-        break;
-      }
-    } else {
-      if (It->second == OldBb) {
-        Found = true;
-        break;
-      }
-    }
-  }
-  assert(Found && "Old exit not found in the mapping!");
-  CurrMapping.erase(It);
-  if (IsLeft) {
-    CurrMapping.insert(
-        std::pair<BasicBlock *, BasicBlock *>(NewBb, ExitBlockR));
-  } else {
-    CurrMapping.insert(
-        std::pair<BasicBlock *, BasicBlock *>(ExitBlockL, NewBb));
-  }
-}
-
-void RegionMelder::runPreMergePasses(bool RegionAlreadySimplified) {
-
-  // check if exit blocks need to be isolated
-  if (ExitBlockL) {
-    if (!RegionAlreadySimplified) {
+  auto SimplifyHelper = [&](BasicBlock *Entry, BasicBlock *Exit,
+                            bool IsLeft) -> BasicBlock * {
+    if (!MeldInfo.RegionsSimplified) {
       DEBUG << "Simplifying left region\n";
-      BasicBlock *OldExitLeft = ExitBlockL;
-      ExitBlockL = simplifyRegion(ExitBlockL, EntryBlockL);
+      BasicBlock *OldExit = Exit;
+      BasicBlock *NewExit = simplifyRegion(Exit, Entry);
       // update the mapping
-      updateMapping(ExitBlockL, OldExitLeft, true);
-      MA.getCFGInfo().recompute();
+      MeldInfo.updateBlockMap(NewExit, OldExit, IsLeft);
+      return NewExit;
     }
-  }
+    return Exit;
+  };
 
-  if (ExitBlockR) {
-    if (!RegionAlreadySimplified) {
-      DEBUG << "Simplifying right region\n";
-      BasicBlock *OldExitRight = ExitBlockR;
-      ExitBlockR = simplifyRegion(ExitBlockR, EntryBlockR);
-      // update the mapping
-      updateMapping(ExitBlockR, OldExitRight, false);
-      MA.getCFGInfo().recompute();
-    }
+  if (MeldInfo.LExit) {
+    MeldInfo.LExit = SimplifyHelper(MeldInfo.LEntry, MeldInfo.LExit, true);
+    CFGInfo.recompute();
   }
-
-  mergeOutsideDefsAtEntry();
+  if (MeldInfo.RExit) {
+    MeldInfo.RExit = SimplifyHelper(MeldInfo.REntry, MeldInfo.RExit, false);
+    CFGInfo.recompute();
+  }
 }
 
 static void simplifyConditionalBranches(Function *F) {
@@ -1142,18 +1113,23 @@ static void simplifyConditionalBranches(Function *F) {
   }
 }
 
-void RegionMelder::runPostOptimizations() {
-  Function *F = MA.getParentFunction();
+void MeldingHandler::runPostOptimizations() {
   static int Count = 0;
-  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) + ".cfmelder.");
+  // Utils::writeCFGToDotFile(*MA.getParentFunction(), std::to_string(Count++) +
+  // ".cfmelder.");
   INFO << "Running post-merge optimizations\n";
 
   // first, simplify conditional branches
-  simplifyConditionalBranches(F);
+  simplifyConditionalBranches(Func);
+
+  SmallVector<BasicBlock *> BlocksToProcess(
+      make_range(MergedBBs.begin(), MergedBBs.end()));
+  // Unify block needs to be considered
+  BlocksToProcess.push_back(MeldingInfo.UnifyPHIBlock);
 
   // remove empty basic blocks with single incoming edge and single outgoing
   // edge
-  for (BasicBlock *BB : MergedBBs) {
+  for (BasicBlock *BB : BlocksToProcess) {
 
     if (pred_size(BB) == 1 && succ_size(BB) == 1 && BB->size() == 1) {
       // errs() << "processing block " << BB->getNameOrAsOperand() << "\n";
@@ -1203,12 +1179,12 @@ void RegionMelder::runPostOptimizations() {
   }
 
   // previous step can create conditional branches with same successors
-  simplifyConditionalBranches(F);
+  simplifyConditionalBranches(Func);
 
   // check for phi nodes with identical incoming value, block pairs
   // and fold them
 
-  for (auto &BB : *F) {
+  for (auto &BB : *Func) {
     for (PHINode &Phi : BB.phis()) {
       if (Phi.getNumIncomingValues() > pred_size(&BB)) {
         bool Changed = false;
@@ -1217,8 +1193,8 @@ void RegionMelder::runPostOptimizations() {
           for (unsigned I = 0; I < Phi.getNumIncomingValues(); I++) {
             BasicBlock *IncomingBlk = Phi.getIncomingBlock(I);
             // only process incoming values from merged blocks
-            if (std::find(MergedBBs.begin(), MergedBBs.end(), IncomingBlk) ==
-                MergedBBs.end())
+            if (std::find(BlocksToProcess.begin(), BlocksToProcess.end(),
+                          IncomingBlk) == BlocksToProcess.end())
               continue;
             for (unsigned J = I + 1; J < Phi.getNumIncomingValues(); J++) {
               if (Phi.getIncomingBlock(I) == Phi.getIncomingBlock(J) &&
@@ -1239,7 +1215,7 @@ void RegionMelder::runPostOptimizations() {
 
   // remove phi nodes with one incoming value
   SmallVector<PHINode *, 8> PNToDelete;
-  for (auto &BB : *MA.getParentFunction()) {
+  for (auto &BB : *Func) {
     for (auto &Phi : BB.phis()) {
       if (Phi.getNumIncomingValues() == 1)
         PNToDelete.push_back(&Phi);
@@ -1256,4 +1232,41 @@ void RegionMelder::runPostOptimizations() {
 
   // Utils::writeCFGToDotFile(*F, std::to_string(Count++) + ".cfmelder.");
   // verifyFunction(*F);
+}
+
+void RegionMeldingInfo::print() {
+  INFO << "Melding entry blocks "
+       << (LEntry ? LEntry->getNameOrAsOperand() : "[null]") << " , "
+       << (REntry ? REntry->getNameOrAsOperand() : "[null]") << "\n";
+
+  if (LExit && RExit) {
+    INFO << "Melding exit blocks " << LExit->getNameOrAsOperand() << " , "
+         << RExit->getNameOrAsOperand() << "\n";
+  }
+}
+
+void RegionMeldingInfo::updateBlockMap(BasicBlock *NewBb, BasicBlock *OldBb,
+                                       bool IsLeft) {
+  auto It = BlockMap.begin();
+  bool Found = false;
+  for (; It != BlockMap.end(); ++It) {
+    if (IsLeft) {
+      if (It->first == OldBb) {
+        Found = true;
+        break;
+      }
+    } else {
+      if (It->second == OldBb) {
+        Found = true;
+        break;
+      }
+    }
+  }
+  assert(Found && "Old exit not found in the mapping!");
+  BlockMap.erase(It);
+  if (IsLeft) {
+    BlockMap.insert(std::pair<BasicBlock *, BasicBlock *>(NewBb, RExit));
+  } else {
+    BlockMap.insert(std::pair<BasicBlock *, BasicBlock *>(LExit, NewBb));
+  }
 }
