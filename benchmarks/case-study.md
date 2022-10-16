@@ -93,4 +93,8 @@ if else with identical regions inside
 * 99 to  49 (5.050505e+01%)
 
 
+# 464.h264ref
 
+semef works well, non isomorphic regions
+
+SubPelBlockSearchBiPred: 4142 to  2459 (4.063254e+01%)
